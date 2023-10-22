@@ -8,7 +8,15 @@ from copy import deepcopy
 import encoding
 
 class NRC_MLP(nn.Module):
-    def __init__(self, input_dim=64, hash_enc=None, ref_factor=True, dtype=torch.float32, radiance_scale=1.):
+    def __init__(
+            self, 
+            mlp_width=64,
+            mlp_depth=5,
+            hash_enc=None, 
+            ref_factor=True, 
+            dtype=torch.float32, 
+            radiance_scale=1.
+            ):
         '''
             Note that the actual input dim is 62
             We pad two colums of 1 to allow implicit bias
@@ -20,25 +28,23 @@ class NRC_MLP(nn.Module):
         self.hash_enc = hash_enc
         self.radiance_scale = radiance_scale
 
+        input_dim = 64
         if hash_enc is not None:
             input_dim = 64 - 36 + hash_enc.output_dim
 
+        mlp_layers = [
+            nn.Linear(input_dim, mlp_width, bias=False).to(dtype=dtype),
+            nn.ReLU(),
+        ]
 
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 64, bias=False).to(dtype=dtype),
-            nn.ReLU(),
-            nn.Linear(64, 64, bias=False).to(dtype=dtype),
-            nn.ReLU(),
-            nn.Linear(64, 64, bias=False).to(dtype=dtype),
-            nn.ReLU(),
-            nn.Linear(64, 64, bias=False).to(dtype=dtype),
-            nn.ReLU(),
-            nn.Linear(64, 64, bias=False).to(dtype=dtype),
-            nn.ReLU(),
-            nn.Linear(64, 64, bias=False).to(dtype=dtype),
-            nn.ReLU(),
-            nn.Linear(64, 3, bias=False).to(dtype=dtype),
-        )
+        for _ in range(mlp_depth):
+            mlp_layers.append(nn.Linear(mlp_width, mlp_width, bias=False).to(dtype=dtype))
+            mlp_layers.append(nn.ReLU())
+
+        mlp_layers.append(nn.Linear(mlp_width, 3, bias=False).to(dtype=dtype))
+
+
+        self.mlp = nn.Sequential(*mlp_layers)
 
         self.freq_embed = encoder.FreqEmbed()
         self.blob_embd = encoder.OneBlobEmbed()
@@ -91,7 +97,17 @@ class NRC_MLP(nn.Module):
         # return alpha
 
 class NRC:
-    def __init__(self, input_dim=64, ref_factor=True, ma_alpha=0.99, dtype=torch.float32, device='cuda', radiance_scale=1.):
+    def __init__(
+            self, 
+            mlp_width=64,
+            mlp_depth=5,
+            use_hash_grid=True,
+            ref_factor=True, 
+            mlp_ma_alpha=0.99, 
+            dtype=torch.float32, 
+            device='cuda', 
+            radiance_scale=1.
+            ):
         '''
             Note that the actual input dim is 62
             We pad two colums of 1 to allow implicit bias
@@ -99,16 +115,16 @@ class NRC:
             ref_factor: Reflectance factorization
             ma_alpha: moving average alpha
         '''
-
-        hash_enc = encoding.MultiResHashGrid(3).to(device)
-        # hash_enc = None
-        self.train_mlp = NRC_MLP(input_dim, hash_enc, ref_factor, dtype, radiance_scale=radiance_scale).to(device)
+        self.hash_enc = None
+        if use_hash_grid:
+            self.hash_enc = encoding.MultiResHashGrid(3).to(device)
+        self.train_mlp = NRC_MLP(mlp_width, mlp_depth, self.hash_enc, ref_factor, dtype, radiance_scale=radiance_scale).to(device)
         self.inference_mlp = deepcopy(self.train_mlp)
         self.radiance_scale = radiance_scale
 
 
         # moving average alpha
-        self.ma_alpha = ma_alpha
+        self.ma_alpha = mlp_ma_alpha
         if self.ma_alpha == 1:
             # disable moving average
             self.inference_mlp = self.train_mlp
@@ -164,14 +180,57 @@ class NRC:
         infer_outs = torch.concat(infer_outs,axis=0)
 
         return infer_outs
+    
+    def  tv_reg(self, ratio=0.0001):
+        '''
+        Apply total variation loss on part of the grids
+        '''
+
+        size = self.hash_enc.finest_resolution - 1
+
+        N = int((self.hash_enc.finest_resolution)**3 * ratio)
+
+        coords = torch.randint(0, size, (N, 3)).to(self.device)
+
+        latents = self.hash_enc(coords/size)
+
+        tv_loss = 0
 
 
-    def train(self, inputs, targets, optimizer, batch_num=4, relative_loss=True, apply_factorization=True):
+        for ax_i in range(3):
+            coords_2 = coords.clone()
+            coords_2[:,ax_i] += 1
+            coords_2 = torch.clamp_max(coords_2, size)
+
+            latents_2 = self.hash_enc(coords_2/size)
+
+            # tv_loss += ((latents - latents_2)**2).mean()
+            tv_loss += (torch.abs(latents - latents_2)).mean()
+
+
+        return tv_loss
+
+
+
+    def train(
+            self, 
+            inputs, 
+            targets, 
+            optimizer, 
+            batch_num=4, 
+            relative_loss=True, 
+            apply_factorization=True, 
+            lambda_tv=0.,
+            wandb=None
+        ):
         '''
         batch_num: slipt data into several batches and perform multiple training steps
         relative_loss: needed when expected outputs are noisy. Paper Sec 5
         '''
-        mean_loss = 0.
+        loss_log = {
+            'render_loss' : 0.,
+            'tv_loss' : 0.,
+        }
 
         targets = self._to_tensor(targets)
         p, wi, n, alpha, beta, r = inputs
@@ -183,6 +242,7 @@ class NRC:
         
         # multiple steps per frame
         for i in range(batch_num):
+            loss = 0.
             optimizer.zero_grad()
             pred = self.train_mlp(
                 self._to_tensor(p[ids[i]]),
@@ -193,12 +253,23 @@ class NRC:
                 self._to_tensor(r[ids[i]]),
                 apply_factorization=apply_factorization,
             )
-            loss = (targets[ids[i]] - pred)**2
-            luminance = 0.299 * pred[:,0] + 0.587 * pred[:,1] + 0.114 * pred[:,2]
+            render_loss = (targets[ids[i]] - pred)**2
 
             if relative_loss:
-                loss = loss / (luminance[:, None].detach().clone()**2 + 1e-5)
-            loss = torch.mean(loss)
+                luminance = 0.299 * pred[:,0] + 0.587 * pred[:,1] + 0.114 * pred[:,2]
+                render_loss = render_loss / (luminance[:, None].detach().clone()**2 + 1e-5)
+            
+            render_loss = torch.mean(render_loss)
+            loss += render_loss
+
+            if lambda_tv > 0.:
+                # apply TV
+                tv_loss = self.tv_reg()
+                loss += tv_loss * lambda_tv
+            else:
+                tv_loss = torch.tensor(0.)
+
+
             loss.backward()
             optimizer.step()
 
@@ -212,6 +283,11 @@ class NRC:
                                     + self.ma_alpha * (1-(self.ma_alpha**(self.t-1))) * state_inf[key]
 
 
-            mean_loss += loss
+            loss_log['render_loss'] += render_loss.item()
+            loss_log['tv_loss'] += tv_loss.item()
 
-        return mean_loss / batch_num
+        
+        for k in loss_log.keys():
+            loss_log[k] /= batch_num
+
+        return loss_log

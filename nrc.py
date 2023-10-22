@@ -11,6 +11,8 @@ import pandas as pd
 import yaml
 import wandb
 from tqdm import tqdm
+import argparse
+
 
 INVALID_INDEX = 0x007FFFFF
 IMAGE_SIZE = (512, 512)
@@ -107,34 +109,48 @@ def prepare_batch(df_query:pd.DataFrame, df_train_vertex:Optional[pd.DataFrame]=
 
 
 def main():
-    config_path = './config/cornell_box_dy/base.yaml'
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config', type=str, default='./config/cornell_box_dy/tv.yaml')
+    args = parser.parse_args()
+
+    config_path = args.config
+
 
     with open(config_path, 'rt') as f:
         config = yaml.safe_load(f.read())
 
+    exp_conf = config['exp']
+
+    if 'name' in config['log']:
+        run_name = config['log']['name']
+    else:
+        run_name = config_path.replace('./config/', '').replace('.yaml', '')
+
     wandb.init(
         project=config['log']['project'],
-        name=config['log']['name'],
-        config=config['exp'],
+        name=run_name,
+        config=exp_conf,
     )
 
-    log_dir = Path('exp') / config['log']['name']
+    log_dir = Path('exp') / run_name
     log_dir.mkdir(exist_ok=True, parents=True)
+    (log_dir / 'render').mkdir(exist_ok=True, parents=True)
     
     torch.manual_seed(0)
 
 
-    exp_path = Path(config['exp']['query_path'])
+    exp_path = Path(exp_conf['query_path'])
 
-    radiance_scale = config['exp']['radiance_scale']
+    radiance_scale = exp_conf['model_params']['radiance_scale']
 
-    mlp = NRC(ma_alpha=config['exp']['mlp_ma_alpha'], radiance_scale=radiance_scale)
+    mlp = NRC(**exp_conf['model_params'])
 
-
-    optimizer = torch.optim.Adam(params=mlp.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(params=mlp.parameters(), lr=float(exp_conf['lr']))
 
     h5_lists = sorted(list(exp_path.glob('*.h5')))
     N_FRAME = len(h5_lists)
+
+    imgs = []
 
     for frame_id in tqdm(range(N_FRAME)):
         store = pd.HDFStore(str(h5_lists[frame_id]))
@@ -156,9 +172,11 @@ def main():
         propagate_radiance_values(df_pre_train_infer, df_train_vertex, infer_outs)
 
         # with Timer('prep train batch'):
-        inputs, targets = prepare_batch(df_train_query, df_train_vertex, cpp_target=config['exp']['cpp_target'])
+        inputs, targets = prepare_batch(df_train_query, df_train_vertex, cpp_target=exp_conf['cpp_target'])
 
-        loss = mlp.train(inputs, targets, optimizer, apply_factorization=False)
+        loss = mlp.train(inputs, targets, optimizer,
+                         **exp_conf['train_params'],
+                         wandb=wandb)
 
 
         wandb.log({'train/loss': loss})
@@ -171,8 +189,20 @@ def main():
         visual_outs = mlp.batch_infer(visual_inputs) / radiance_scale
 
         image = torch.clamp(visual_outs.reshape([*IMAGE_SIZE, 3]), 0., 1.).cpu().numpy()
+        image = (image * 255).astype(np.uint8)
 
-        imageio.imwrite(str(log_dir / f"render_{frame_id:05d}.png"), (image * 255).astype(np.uint8))
+        imageio.imwrite(str(log_dir / 'render'/ f"render_{frame_id:05d}.png"), image)
+
+        imgs.append(image)
+
+    writer = imageio.get_writer(str(log_dir / 'render.mp4'), fps=10)
+    for im in imgs:
+        writer.append_data(im)
+    writer.close()
+
+
+
+    
 
 
 
