@@ -6,6 +6,76 @@ from model.utils import to_sphe_coords
 import numpy as np
 from copy import deepcopy
 import encoding
+from model.utils import apply_weight_init_fn, leaky_relu_init
+
+
+
+class LipshitzMLP(torch.nn.Module):
+    def __init__(self, in_channels, nr_out_channels_per_layer:list, last_layer_linear:bool=True):
+        super(LipshitzMLP, self).__init__()
+
+        self.last_layer_linear=last_layer_linear
+
+        self.layers=torch.nn.ModuleList()
+        for i in range(len(nr_out_channels_per_layer)):
+            cur_out_channels=nr_out_channels_per_layer[i]
+            self.layers.append(  torch.nn.Linear(in_channels, cur_out_channels)   )
+            in_channels=cur_out_channels
+        apply_weight_init_fn(self, leaky_relu_init, negative_slope=0.0)
+        if last_layer_linear:
+            leaky_relu_init(self.layers[-1], negative_slope=1.0)
+
+        #we make each weight separately because we want to add the normalize to it
+        self.weights_per_layer=torch.nn.ParameterList()
+        self.biases_per_layer=torch.nn.ParameterList()
+        for i in range(len(self.layers)):
+            self.weights_per_layer.append( self.layers[i].weight  )
+            self.biases_per_layer.append( self.layers[i].bias  )
+
+        self.lipshitz_bound_per_layer=torch.nn.ParameterList()
+        for i in range(len(self.layers)):
+            max_w= torch.max(torch.sum(torch.abs(self.weights_per_layer[i]), dim=1))
+            #we actually make the initial value quite large because we don't want at the beggining to hinder the rgb model in any way. A large c means that the scale will be 1
+            c = torch.nn.Parameter(  torch.ones((1))*max_w*2 ) 
+            self.lipshitz_bound_per_layer.append(c)
+
+
+        self.weights_initialized=True #so that apply_weight_init_fn doesnt initialize anything
+
+    def normalization(self, w, softplus_ci):
+        absrowsum = torch.sum(torch.abs(w), dim=1)
+        # scale = torch.minimum(torch.tensor(1.0), softplus_ci/absrowsum)
+        # this is faster than the previous line since we don't constantly recreate a torch.tensor(1.0)
+        scale = softplus_ci/absrowsum
+        scale = torch.clamp(scale, max=1.0)
+        return w * scale[:,None]
+
+    def lipshitz_bound_full(self):
+        lipshitz_full=1
+        for i in range(len(self.layers)):
+            lipshitz_full=lipshitz_full*torch.nn.functional.softplus(self.lipshitz_bound_per_layer[i])
+
+        return lipshitz_full
+
+    def forward(self, x):
+        for i in range(len(self.layers)):
+            weight=self.weights_per_layer[i]
+            bias=self.biases_per_layer[i]
+
+            weight=self.normalization(weight, torch.nn.functional.softplus(self.lipshitz_bound_per_layer[i])  )
+
+            x=torch.nn.functional.linear(x, weight, bias)
+
+            is_last_layer=i==(len(self.layers)-1)
+
+            if is_last_layer and self.last_layer_linear:
+                pass
+            else:
+                x=torch.nn.functional.gelu(x)
+
+
+        return x
+
 
 class NRC_MLP(nn.Module):
     def __init__(
@@ -15,7 +85,7 @@ class NRC_MLP(nn.Module):
             hash_enc=None, 
             ref_factor=True, 
             dtype=torch.float32, 
-            radiance_scale=1.
+            use_lipshitz:bool=False,
             ):
         '''
             Note that the actual input dim is 62
@@ -26,25 +96,29 @@ class NRC_MLP(nn.Module):
         super(NRC_MLP, self).__init__()
         self.ref_factor = ref_factor
         self.hash_enc = hash_enc
-        self.radiance_scale = radiance_scale
+        self.use_lipshitz = use_lipshitz
 
         input_dim = 64
         if hash_enc is not None:
             input_dim = 64 - 36 + hash_enc.output_dim
 
-        mlp_layers = [
-            nn.Linear(input_dim, mlp_width, bias=False).to(dtype=dtype),
-            nn.ReLU(),
-        ]
+        if use_lipshitz:
+            channels = [mlp_width for _ in range(mlp_depth)] + [3]
+            self.mlp = LipshitzMLP(input_dim, channels)
+        else:
+            mlp_layers = [
+                nn.Linear(input_dim, mlp_width, bias=False).to(dtype=dtype),
+                nn.ReLU(),
+            ]
 
-        for _ in range(mlp_depth):
-            mlp_layers.append(nn.Linear(mlp_width, mlp_width, bias=False).to(dtype=dtype))
-            mlp_layers.append(nn.ReLU())
+            for _ in range(mlp_depth):
+                mlp_layers.append(nn.Linear(mlp_width, mlp_width, bias=False).to(dtype=dtype))
+                mlp_layers.append(nn.ReLU())
 
-        mlp_layers.append(nn.Linear(mlp_width, 3, bias=False).to(dtype=dtype))
+            mlp_layers.append(nn.Linear(mlp_width, 3, bias=False).to(dtype=dtype))
 
 
-        self.mlp = nn.Sequential(*mlp_layers)
+            self.mlp = nn.Sequential(*mlp_layers)
 
         self.freq_embed = encoder.FreqEmbed()
         self.blob_embd = encoder.OneBlobEmbed()
@@ -76,7 +150,8 @@ class NRC_MLP(nn.Module):
                 # self.blob_embd.embed(to_sphe_coords(n)),
                 self.blob_embd.embed(wi),
                 self.blob_embd.embed(n),
-                self.blob_embd.embed(1.-torch.exp(-r)),
+                # self.blob_embd.embed(1.-torch.exp(-r)),
+                self.blob_embd.embed(r), # roughness is already applied with 1-exp(-r)
                 alpha,
                 beta,
                 torch.ones_like(p[:,:2])
@@ -106,7 +181,8 @@ class NRC:
             mlp_ma_alpha=0.99, 
             dtype=torch.float32, 
             device='cuda', 
-            radiance_scale=1.
+            use_lipshitz=False,
+            **kwargs,
             ):
         '''
             Note that the actual input dim is 62
@@ -118,9 +194,8 @@ class NRC:
         self.hash_enc = None
         if use_hash_grid:
             self.hash_enc = encoding.MultiResHashGrid(3).to(device)
-        self.train_mlp = NRC_MLP(mlp_width, mlp_depth, self.hash_enc, ref_factor, dtype, radiance_scale=radiance_scale).to(device)
+        self.train_mlp = NRC_MLP(mlp_width, mlp_depth, self.hash_enc, ref_factor, dtype, use_lipshitz=use_lipshitz).to(device)
         self.inference_mlp = deepcopy(self.train_mlp)
-        self.radiance_scale = radiance_scale
 
 
         # moving average alpha
@@ -221,6 +296,7 @@ class NRC:
             relative_loss=True, 
             apply_factorization=True, 
             lambda_tv=0.,
+            lambda_lipshitz=0.,
             wandb=None
         ):
         '''
@@ -230,6 +306,7 @@ class NRC:
         loss_log = {
             'render_loss' : 0.,
             'tv_loss' : 0.,
+            'lipshitz_loss' : 0.,
         }
 
         targets = self._to_tensor(targets)
@@ -269,6 +346,13 @@ class NRC:
             else:
                 tv_loss = torch.tensor(0.)
 
+            if lambda_lipshitz > 0.:
+                # apply TV
+                lipshitz_loss = self.train_mlp.mlp.lipshitz_bound_full()[0]
+                loss += lipshitz_loss * lambda_lipshitz
+            else:
+                lipshitz_loss = torch.tensor(0.)
+
 
             loss.backward()
             optimizer.step()
@@ -279,12 +363,18 @@ class NRC:
                 state_wt = self.train_mlp.state_dict()
                 state_inf = self.inference_mlp.state_dict()
                 for key in state_inf:
+                    # nau = lambda t: 1 - self.ma_alpha**t
+                    # s = lambda t: ((1 - self.ma_alpha) / nau(t)) + (self.ma_alpha * nau(t-1))
+
                     state_inf[key] = (1 - self.ma_alpha) / (1-(self.ma_alpha**self.t)) * state_wt[key] \
                                     + self.ma_alpha * (1-(self.ma_alpha**(self.t-1))) * state_inf[key]
+                    
+                self.inference_mlp.load_state_dict(state_inf)
 
 
             loss_log['render_loss'] += render_loss.item()
             loss_log['tv_loss'] += tv_loss.item()
+            loss_log['lipshitz_loss'] += lipshitz_loss.item()
 
         
         for k in loss_log.keys():

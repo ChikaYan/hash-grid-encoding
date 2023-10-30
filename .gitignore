@@ -136,3 +136,7 @@ config/
 .vscode/
 
 wandb/
+
+ext/
+
+scene/

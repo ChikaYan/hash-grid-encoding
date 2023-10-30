@@ -12,6 +12,7 @@ import yaml
 import wandb
 from tqdm import tqdm
 import argparse
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 INVALID_INDEX = 0x007FFFFF
@@ -19,17 +20,24 @@ IMAGE_SIZE = (512, 512)
 
 DEVICE = 'cuda'
 
-def get_float3(df, name):
-    return df[[f'{name}_x', f'{name}_y', f'{name}_z']].to_numpy()
 
-def set_float3(df, idx, name, value):
-    df.at[idx, f'{name}_x'] = value[0]
-    df.at[idx, f'{name}_y'] = value[1]
-    df.at[idx, f'{name}_z'] = value[2]
+
+def unify_float3(df:pd.DataFrame):
+    # unify _x, _y, _z entries in df into a list entry
+    for col in df.columns:
+        if not col.endswith('_x'):
+            continue
+
+        entry_name = col[:-2]
+        if not (f'{entry_name}_y' in df.columns and  f'{entry_name}_z' in df.columns):
+            continue
+
+        df[entry_name] = df[[f'{entry_name}_x', f'{entry_name}_y', f'{entry_name}_z']].to_numpy().tolist()
 
 def propagate_radiance_values(
         df_pre_train_infer:pd.DataFrame, 
         df_train_vertex:pd.DataFrame, 
+        df_train_query:pd.DataFrame,
         inferred_radiance:torch.Tensor, 
         radiance_scale:float=1.
     ):
@@ -46,7 +54,7 @@ def propagate_radiance_values(
 
         contribution = torch.zeros(3)
 
-        if df_pre_train_infer.at[i, 'has_query']:
+        if df_pre_train_infer.at[i, 'has_query'] == 1.:
             offset = IMAGE_SIZE[0] * IMAGE_SIZE[1]
             contribution = torch.clamp_min(inferred_radiance[offset + i], 0)
 
@@ -57,21 +65,24 @@ def propagate_radiance_values(
             inferred_query = df_pre_train_infer.iloc[offset + i]
 
             contribution = contribution * \
-                torch.tensor(get_float3(inferred_query, 'diffuse_reflectance')) + torch.tensor(get_float3(inferred_query, 'specular_reflectance'))
+                (torch.tensor(inferred_query['diffuse_reflectance']) + torch.tensor(inferred_query['specular_reflectance']))
             
+        if i == 143:
+            print()
+
         last_train_data_index = int(df_pre_train_infer.at[i, 'prev_vertex_data_index'])
         while (last_train_data_index != INVALID_INDEX):
             vertex_info = df_train_vertex.iloc[last_train_data_index]
-            query = df_pre_train_infer.iloc[last_train_data_index]
-            target_value = torch.tensor(get_float3(vertex_info, 'target_train_buffer'))
-            indirect_cont = torch.tensor(get_float3(vertex_info, 'local_throughput')) * contribution
+            query = df_train_query.iloc[last_train_data_index]
+            target_value = torch.tensor(vertex_info['target_train_buffer'])
+            indirect_cont = torch.tensor(vertex_info['local_throughput']) * contribution
             contribution = target_value + indirect_cont
 
-            # here we store target value as the actual RGB rendering, instead of the coefficients before factorization
-            contribution = contribution / (torch.tensor(get_float3(query, 'diffuse_reflectance') + get_float3(query, 'specular_reflectance')))
-            contribution = torch.nan_to_num(contribution, 0., 0., 0.)
-            set_float3(df_train_vertex, last_train_data_index, 'target_train_buffer', contribution.numpy())
-            # df_train_vertex.at[last_train_data_index, 'target_train_buffer'] = target_value.tolist()
+            new_target = contribution / (torch.tensor(query['diffuse_reflectance']) + torch.tensor(query['specular_reflectance']))
+            new_target = torch.nan_to_num(new_target, 0., 0., 0.)
+
+
+            df_train_vertex.at[last_train_data_index, 'target_train_buffer'] = new_target.numpy()
 
 
             last_train_data_index = int(vertex_info['prev_vertex_data_index'])
@@ -79,21 +90,23 @@ def propagate_radiance_values(
     
 
     
-def prepare_batch(df_query:pd.DataFrame, df_train_vertex:Optional[pd.DataFrame]=None, cpp_target:bool=False):
+def prepare_batch(df_query:pd.DataFrame, df_train_vertex:Optional[pd.DataFrame]=None, cpp_target:bool=False, radiance_scale:float=1.):
     N = len(df_query)
 
-    p = torch.tensor(get_float3(df_query, 'position')).contiguous()
+    p = torch.tensor(np.stack(df_query['position'])).contiguous()
     wi = torch.tensor([df_query['vOut_phi'].to_list(), df_query['vOut_theta'].to_list()]).T.contiguous()
     n = torch.tensor([df_query['normal_phi'].to_list(), df_query['normal_theta'].to_list()]).T.contiguous()
-    alpha = torch.tensor(get_float3(df_query, 'diffuse_reflectance')).contiguous()
-    beta = torch.tensor(get_float3(df_query, 'specular_reflectance')).contiguous()
+    alpha = torch.tensor(np.stack(df_query['diffuse_reflectance'])).contiguous()
+    beta = torch.tensor(np.stack(df_query['specular_reflectance'])).contiguous()
     r = torch.tensor(df_query['roughness'].to_list()).contiguous()
 
     if df_train_vertex is not None:
+        t1 = torch.tensor(np.stack(df_query['target'])[:N]).contiguous() / 10. * radiance_scale
+        t2 = torch.tensor(np.stack(df_train_vertex['target_train_buffer'])[:N]).contiguous() * radiance_scale
         if cpp_target:
-            targets = torch.tensor(get_float3(df_query, 'target')[:N]).contiguous()
+            targets = torch.tensor(np.stack(df_query['target'])[:N]).contiguous() / 10. * radiance_scale
         else:
-            targets = torch.tensor(get_float3(df_train_vertex, 'target_train_buffer')[:N]).contiguous()
+            targets = torch.tensor(np.stack(df_train_vertex['target_train_buffer'])[:N]).contiguous() * radiance_scale
 
     else:
         targets = None
@@ -110,7 +123,8 @@ def prepare_batch(df_query:pd.DataFrame, df_train_vertex:Optional[pd.DataFrame]=
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--config', type=str, default='./config/cornell_box_dy/tv.yaml')
+    parser.add_argument('-c', '--config', type=str, default='./config/lipshitz/1e-2_lr_1e-3.yaml')
+    parser.add_argument('-s', '--scene_path', type=str, default='scene/cornell_box_dy')
     args = parser.parse_args()
 
     config_path = args.config
@@ -124,22 +138,25 @@ def main():
     if 'name' in config['log']:
         run_name = config['log']['name']
     else:
-        run_name = config_path.replace('./config/', '').replace('.yaml', '')
+        run_name = config_path.replace('config/', '').replace('.yaml', '')
+
+    scene_name = Path(args.scene_path).name
 
     wandb.init(
         project=config['log']['project'],
         name=run_name,
         config=exp_conf,
+        group=scene_name,
     )
 
-    log_dir = Path('exp') / run_name
+    log_dir = Path('exp') / scene_name / run_name
     log_dir.mkdir(exist_ok=True, parents=True)
     (log_dir / 'render').mkdir(exist_ok=True, parents=True)
     
     torch.manual_seed(0)
 
 
-    exp_path = Path(exp_conf['query_path'])
+    exp_path = Path(args.scene_path)
 
     radiance_scale = exp_conf['model_params']['radiance_scale']
 
@@ -161,39 +178,49 @@ def main():
         df_rendering_infer = store['df_rendering_infer']
         store.close()
 
+        for df in [df_pre_train_infer, df_train_query, df_train_vertex, df_rendering_infer]:
+            unify_float3(df)
 
+        # with profile(activities=[]) as prof:
+            
         # query NRC to prepare self-training
-        # with Timer('prep pre train infer batch'):
-        infer_inputs, _ = prepare_batch(df_pre_train_infer)
-        infer_outs = mlp.batch_infer(infer_inputs).to('cpu')
+        with record_function('prep pre train infer batch'):
+            infer_inputs, _ = prepare_batch(df_pre_train_infer)
+            infer_outs = mlp.batch_infer(infer_inputs).to('cpu')
 
 
-        # with Timer('propagate radiance values'):
-        propagate_radiance_values(df_pre_train_infer, df_train_vertex, infer_outs)
+        with record_function('propagate radiance values'):
+            propagate_radiance_values(df_pre_train_infer, df_train_vertex, df_train_query, infer_outs, radiance_scale=radiance_scale)
 
-        # with Timer('prep train batch'):
-        inputs, targets = prepare_batch(df_train_query, df_train_vertex, cpp_target=exp_conf['cpp_target'])
+        with record_function('prep train batch'):
+            inputs, targets = prepare_batch(df_train_query, df_train_vertex, cpp_target=exp_conf['cpp_target'], radiance_scale=radiance_scale)
 
-        loss = mlp.train(inputs, targets, optimizer,
-                         **exp_conf['train_params'],
-                         wandb=wandb)
+        with record_function('Train'):
+            loss = mlp.train(inputs, targets, optimizer,
+                            **exp_conf['train_params'],
+                            wandb=wandb)
 
 
         wandb.log({'train/loss': loss})
 
         # visualize predictions
-        # with Timer('prep visualize batch'):
-        visual_inputs, _ = prepare_batch(df_rendering_infer)
+        with record_function('prep visualize batch'):
+            visual_inputs, _ = prepare_batch(df_rendering_infer)
 
-        # with Timer('infer visualize batch'):
-        visual_outs = mlp.batch_infer(visual_inputs) / radiance_scale
+        with record_function('infer visualize batch'):
+            visual_outs = mlp.batch_infer(visual_inputs) / radiance_scale
+
+
 
         image = torch.clamp(visual_outs.reshape([*IMAGE_SIZE, 3]), 0., 1.).cpu().numpy()
-        image = (image * 255).astype(np.uint8)
+        image = np.clip((image * 10 * 255), 0, 255).astype(np.uint8)
 
         imageio.imwrite(str(log_dir / 'render'/ f"render_{frame_id:05d}.png"), image)
 
         imgs.append(image)
+
+        # print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
+        # print()
 
     writer = imageio.get_writer(str(log_dir / 'render.mp4'), fps=10)
     for im in imgs:
