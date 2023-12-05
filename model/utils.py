@@ -22,6 +22,24 @@ def to_sphe_coords(dirs):
     return torch.stack([theta, phi], axis=-1)
 
 
+def srgb_calc_luminance(value: np.ndarray):
+    return 0.2126729 * value[:,0] + 0.7151522 * value[:,1] + 0.0721750 * value[:,2]
+
+def simple_tone_map_s(value: np.ndarray):
+    assert (value >= 0).all(), f"Input value must be equal to or greater than 0: {value}" 
+    return 1 - np.exp(-value)
+
+# def srgb_degamma_s(value: np.ndarray):
+#     assert (value >= 0).all(), f"Input value must be equal to or greater than 0: {value}" 
+
+#     return np.where(value <= 0.04045, value / 12.92, np.power((value + 0.055) / 1.055, 2.4))
+
+def srgb_gamma_s(value: np.ndarray):
+    assert (value >= 0).all(), f"Input value must be equal to or greater than 0: {value}" 
+
+    return np.where(value <= 0.0031308, 12.92 * value, 1.055 * np.power(value, 1 / 2.4) - 0.055)
+
+
 
 class Timer:    
     def __init__(self, prompt='') -> None:

@@ -6,13 +6,14 @@ from pathlib import Path
 from model.model import NRC
 from typing import Optional
 import imageio
-from model.utils import Timer
+from model.utils import Timer, simple_tone_map_s, srgb_calc_luminance, srgb_gamma_s
 import pandas as pd
 import yaml
 import wandb
 from tqdm import tqdm
 import argparse
 from torch.profiler import profile, record_function, ProfilerActivity
+import cv2
 
 
 INVALID_INDEX = 0x007FFFFF
@@ -33,6 +34,8 @@ def unify_float3(df:pd.DataFrame):
             continue
 
         df[entry_name] = df[[f'{entry_name}_x', f'{entry_name}_y', f'{entry_name}_z']].to_numpy().tolist()
+
+        df.drop([f'{entry_name}_x', f'{entry_name}_y', f'{entry_name}_z'], axis=1, inplace=True)
 
 def propagate_radiance_values(
         df_pre_train_infer:pd.DataFrame, 
@@ -90,7 +93,7 @@ def propagate_radiance_values(
     
 
     
-def prepare_batch(df_query:pd.DataFrame, df_train_vertex:Optional[pd.DataFrame]=None, cpp_target:bool=False, radiance_scale:float=1.):
+def prepare_batch(df_query:pd.DataFrame, radiance_scale:float=1., spp_id:int=None):
     N = len(df_query)
 
     p = torch.tensor(np.stack(df_query['position'])).contiguous()
@@ -100,16 +103,19 @@ def prepare_batch(df_query:pd.DataFrame, df_train_vertex:Optional[pd.DataFrame]=
     beta = torch.tensor(np.stack(df_query['specular_reflectance'])).contiguous()
     r = torch.tensor(df_query['roughness'].to_list()).contiguous()
 
-    if df_train_vertex is not None:
-        t1 = torch.tensor(np.stack(df_query['target'])[:N]).contiguous() / 10. * radiance_scale
-        t2 = torch.tensor(np.stack(df_train_vertex['target_train_buffer'])[:N]).contiguous() * radiance_scale
-        if cpp_target:
-            targets = torch.tensor(np.stack(df_query['target'])[:N]).contiguous() / 10. * radiance_scale
-        else:
-            targets = torch.tensor(np.stack(df_train_vertex['target_train_buffer'])[:N]).contiguous() * radiance_scale
+    if spp_id is None:
+        targets = []
 
+        for k in df_query.keys():
+            if k.startswith('target_'):
+                target_1_spp = torch.tensor(np.stack(df_query[k])[:N]).contiguous() * radiance_scale
+                targets.append(target_1_spp)
+
+        targets = torch.stack(targets).mean(axis=0)
     else:
-        targets = None
+        k = f'target_{spp_id:03d}'
+        targets = torch.tensor(np.stack(df_query[k])[:N]).contiguous() * radiance_scale
+
 
     inputs = [p, wi, n, alpha, beta, r]
 
@@ -123,8 +129,10 @@ def prepare_batch(df_query:pd.DataFrame, df_train_vertex:Optional[pd.DataFrame]=
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--config', type=str, default='./config/lipshitz/1e-2_lr_1e-3.yaml')
-    parser.add_argument('-s', '--scene_path', type=str, default='scene/cornell_box_dy')
+    # parser.add_argument('-c', '--config', type=str, default='./config/debug.yaml')
+    parser.add_argument('-c', '--config', type=str, default='./config/check_target.yaml')
+    parser.add_argument('-s', '--scene_path', type=str, default='scene/living_room_diffuse')
+    parser.add_argument('-n', '--n_frames', type=int, default=None)
     args = parser.parse_args()
 
     config_path = args.config
@@ -136,20 +144,21 @@ def main():
     exp_conf = config['exp']
 
     if 'name' in config['log']:
-        run_name = config['log']['name']
+        RUN_NAME = config['log']['name']
     else:
-        run_name = config_path.replace('config/', '').replace('.yaml', '')
+        RUN_NAME = config_path.replace('config/', '').replace('.yaml', '')
 
-    scene_name = Path(args.scene_path).name
+    SCENE_NAME = Path(args.scene_path).name
+    CHECK_TARGET = exp_conf.get('check_target', False)
 
     wandb.init(
         project=config['log']['project'],
-        name=run_name,
+        name=RUN_NAME,
         config=exp_conf,
-        group=scene_name,
+        group=SCENE_NAME,
     )
 
-    log_dir = Path('exp') / scene_name / run_name
+    log_dir = Path('exp') / SCENE_NAME / RUN_NAME
     log_dir.mkdir(exist_ok=True, parents=True)
     (log_dir / 'render').mkdir(exist_ok=True, parents=True)
     
@@ -167,53 +176,88 @@ def main():
     h5_lists = sorted(list(exp_path.glob('*.h5')))
     N_FRAME = len(h5_lists)
 
+    if args.n_frames is not None:
+        N_FRAME = min(N_FRAME, args.n_frames)
+
     imgs = []
 
     for frame_id in tqdm(range(N_FRAME)):
         store = pd.HDFStore(str(h5_lists[frame_id]))
 
-        df_pre_train_infer = store['df_pre_train_infer']
+        # df_pre_train_infer = store['df_pre_train_infer']
         df_train_query = store['df_train_query']
-        df_train_vertex = store['df_train_vertex']
-        df_rendering_infer = store['df_rendering_infer']
+        # df_train_vertex = store['df_train_vertex']
+        # df_rendering_infer = store['df_rendering_infer']
         store.close()
 
-        for df in [df_pre_train_infer, df_train_query, df_train_vertex, df_rendering_infer]:
+        for df in [df_train_query]:
             unify_float3(df)
 
         # with profile(activities=[]) as prof:
-            
-        # query NRC to prepare self-training
-        with record_function('prep pre train infer batch'):
-            infer_inputs, _ = prepare_batch(df_pre_train_infer)
-            infer_outs = mlp.batch_infer(infer_inputs).to('cpu')
 
+        if config['exp'].get('per_spp', False):
+            n_spp = len([k for k in df_train_query.keys() if k.startswith('target_')])
 
-        with record_function('propagate radiance values'):
-            propagate_radiance_values(df_pre_train_infer, df_train_vertex, df_train_query, infer_outs, radiance_scale=radiance_scale)
+            for spp_id in range(n_spp):
+                with record_function('prep train batch'):
+                    inputs, targets = prepare_batch(df_train_query, radiance_scale=radiance_scale, spp_id=spp_id)
 
-        with record_function('prep train batch'):
-            inputs, targets = prepare_batch(df_train_query, df_train_vertex, cpp_target=exp_conf['cpp_target'], radiance_scale=radiance_scale)
+                with record_function('Train'):
+                    loss = mlp.train(inputs, targets, optimizer,
+                                    **exp_conf['train_params'],
+                                    wandb=wandb)
+        else:
+            with record_function('prep train batch'):
+                # inputs, targets = prepare_batch(df_train_query, radiance_scale=radiance_scale)
+                inputs, targets = prepare_batch(df_train_query, radiance_scale=radiance_scale, spp_id=0)
 
-        with record_function('Train'):
-            loss = mlp.train(inputs, targets, optimizer,
-                            **exp_conf['train_params'],
-                            wandb=wandb)
+            if CHECK_TARGET:
+                loss = {}
+            else:
+                with record_function('Train'):
+                    loss = mlp.train(inputs, targets, optimizer,
+                                    **exp_conf['train_params'],
+                                    wandb=wandb)
 
 
         wandb.log({'train/loss': loss})
 
-        # visualize predictions
-        with record_function('prep visualize batch'):
-            visual_inputs, _ = prepare_batch(df_rendering_infer)
+        if CHECK_TARGET:
+            alpha, beta = inputs[3], inputs[4]
+            visual_outs = targets / radiance_scale * (alpha + beta)
+        else:
+            # visualize predictions
+            with record_function('prep visualize batch'):
+                # visual_inputs, _ = prepare_batch(df_rendering_infer)
+                visual_inputs = inputs
 
-        with record_function('infer visualize batch'):
-            visual_outs = mlp.batch_infer(visual_inputs) / radiance_scale
+            with record_function('infer visualize batch'):
+                visual_outs = mlp.batch_infer(visual_inputs) / radiance_scale
 
 
 
-        image = torch.clamp(visual_outs.reshape([*IMAGE_SIZE, 3]), 0., 1.).cpu().numpy()
-        image = np.clip((image * 10 * 255), 0, 255).astype(np.uint8)
+        image = torch.clamp(visual_outs, 0).cpu().numpy()
+
+        if Path(args.scene_path).name.startswith('living_room'):
+            brightness = 100
+        else:
+            brightness = 10
+
+        # apply tonemapping
+        lum = srgb_calc_luminance(image)
+        lum_t = simple_tone_map_s(brightness * lum)
+        s = np.where(lum > 0., lum_t / np.clip(lum, 1e-5, None), 0.)
+        image *= s[:,None]
+        image = srgb_gamma_s(image)
+
+        image = image.reshape([*IMAGE_SIZE, 3])
+        image = np.clip((image * 255), 0, 255).astype(np.uint8)
+
+
+
+
+        # image = torch.clamp(visual_outs.reshape([*IMAGE_SIZE, 3]), 0., 1.).cpu().numpy()
+        # image = np.clip((image * 10 * 255), 0, 255).astype(np.uint8)
 
         imageio.imwrite(str(log_dir / 'render'/ f"render_{frame_id:05d}.png"), image)
 
@@ -222,7 +266,7 @@ def main():
         # print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
         # print()
 
-    writer = imageio.get_writer(str(log_dir / 'render.mp4'), fps=10)
+    writer = imageio.get_writer(str(log_dir / 'render.mp4'), fps=30)
     for im in imgs:
         writer.append_data(im)
     writer.close()

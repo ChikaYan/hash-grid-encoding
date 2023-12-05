@@ -86,6 +86,7 @@ class NRC_MLP(nn.Module):
             ref_factor=True, 
             dtype=torch.float32, 
             use_lipshitz:bool=False,
+            tri_wave_freq:int=12,
             ):
         '''
             Note that the actual input dim is 62
@@ -98,7 +99,7 @@ class NRC_MLP(nn.Module):
         self.hash_enc = hash_enc
         self.use_lipshitz = use_lipshitz
 
-        input_dim = 64
+        input_dim = 64 - 36 + tri_wave_freq * 3
         if hash_enc is not None:
             input_dim = 64 - 36 + hash_enc.output_dim
 
@@ -120,7 +121,7 @@ class NRC_MLP(nn.Module):
 
             self.mlp = nn.Sequential(*mlp_layers)
 
-        self.freq_embed = encoder.FreqEmbed()
+        self.freq_embed = encoder.FreqEmbed(n_freqs=tri_wave_freq)
         self.blob_embd = encoder.OneBlobEmbed()
 
 
@@ -178,10 +179,11 @@ class NRC:
             mlp_depth=5,
             use_hash_grid=True,
             ref_factor=True, 
-            mlp_ma_alpha=0.99, 
+            mlp_ma_alpha=0.97, 
             dtype=torch.float32, 
             device='cuda', 
             use_lipshitz=False,
+            tri_wave_freq:int=12,
             **kwargs,
             ):
         '''
@@ -194,7 +196,7 @@ class NRC:
         self.hash_enc = None
         if use_hash_grid:
             self.hash_enc = encoding.MultiResHashGrid(3).to(device)
-        self.train_mlp = NRC_MLP(mlp_width, mlp_depth, self.hash_enc, ref_factor, dtype, use_lipshitz=use_lipshitz).to(device)
+        self.train_mlp = NRC_MLP(mlp_width, mlp_depth, self.hash_enc, ref_factor, dtype, use_lipshitz=use_lipshitz, tri_wave_freq=tri_wave_freq).to(device)
         self.inference_mlp = deepcopy(self.train_mlp)
 
 
@@ -366,8 +368,10 @@ class NRC:
                     # nau = lambda t: 1 - self.ma_alpha**t
                     # s = lambda t: ((1 - self.ma_alpha) / nau(t)) + (self.ma_alpha * nau(t-1))
 
-                    state_inf[key] = (1 - self.ma_alpha) / (1-(self.ma_alpha**self.t)) * state_wt[key] \
-                                    + self.ma_alpha * (1-(self.ma_alpha**(self.t-1))) * state_inf[key]
+                    # state_inf[key] = (1 - self.ma_alpha) / (1-(self.ma_alpha**self.t)) * state_wt[key] \
+                    #                 + self.ma_alpha * (1-(self.ma_alpha**(self.t-1))) * state_inf[key]
+                    state_inf[key] = (1 - self.ma_alpha) * state_wt[key] \
+                                    + self.ma_alpha * state_inf[key]
                     
                 self.inference_mlp.load_state_dict(state_inf)
 

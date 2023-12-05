@@ -3,11 +3,11 @@ from torch import nn
 import numpy as np
 
 class FreqEmbed:
-    N_freqs: int = 12
     periodic_fns: list = [torch.sin]
 
-    def __init__(self, input_dims=3):
+    def __init__(self, input_dims=3, n_freqs=12):
         self.input_dims = input_dims
+        self.N_freqs = n_freqs
         self.create_embedding_fn()
         
     def create_embedding_fn(self):
